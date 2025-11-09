@@ -435,7 +435,7 @@ chart_lookback_m = int(st.sidebar.slider("Chart lookback (months)", 1, 24, 2, 1)
 
 mask_date = (df_all["date"] >= start_date) & (df_all["date"] <= end_date)
 df_all = df_all.loc[mask_date].copy()
-df_all = compute_all_indicators(df_all, n_daily=donchian_n, n_weekly=10, n_monthly=6)
+df_all = compute_all_indicators(df_all, n_daily=donchian_n, n_weekly=4, n_monthly=3)
 
 latest_ts = pd.to_datetime(df_all["date"]).max()
 latest_date = latest_ts.date()
