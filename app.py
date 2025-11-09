@@ -4,7 +4,7 @@ import io
 import re
 import gzip
 import zipfile
-import pathlib
+from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 import numpy as np
@@ -35,11 +35,13 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-APP_DIR = os.path.dirname(__file__)
-MASTER_CSV = os.path.join(APP_DIR, "psx_master.csv")
-SECTOR_CSV = os.path.join(APP_DIR, "sector_map_psx.csv")
+# ---------- paths (Cloud-safe) ----------
+APP_DIR = Path(__file__).parent
+MASTER_CSV_REPO = APP_DIR / "psx_master.csv"            # committed file (read-only in Cloud)
+MASTER_CSV_RUNTIME = Path(os.getenv("MASTER_CSV", "/tmp/psx_master.csv"))  # writable copy
+SECTOR_CSV = APP_DIR / "sector_map_psx.csv"
 DEFAULT_DATA_DIR = ""
-USE_MASTER_DEFAULT = os.path.exists(MASTER_CSV)
+USE_MASTER_DEFAULT = MASTER_CSV_RUNTIME.exists() or MASTER_CSV_REPO.exists()
 
 # =========================
 # Sector map (CSV → fallback)
@@ -83,7 +85,7 @@ SECTOR_MAP_FALLBACK: Dict[str, str] = {
     "837": "Exchange Traded Funds",
     "838": "Property",
 }
-FUT_SECTOR_CODES = {"0040", "0041"}
+FUT_SECTOR_CODES = {"0040", "0041"}  # deliverable futures groups
 MONTH_SUFFIX_RE = re.compile(r"-(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|NOVB|NOVC)$", re.IGNORECASE)
 
 # =========================
@@ -147,8 +149,8 @@ def _ensure_sector_name(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _read_text_safely(path: str) -> str:
-    data = pathlib.Path(path).read_bytes()
+def _read_text_safely(path: Path) -> str:
+    data = path.read_bytes()
     if data[:2] == b"\x1f\x8b":
         try:
             return gzip.decompress(data).decode("latin-1", errors="ignore")
@@ -170,27 +172,20 @@ def _read_text_safely(path: str) -> str:
 
 
 def _parse_lis_text(text: str) -> pd.DataFrame:
+    # DDMMMYYYY|SYMB|SECT|Company|Open|High|Low|Close|Volume|LDCP|...
     lines = [ln for ln in text.splitlines() if ln.count("|") >= 9]
     if not lines:
         return pd.DataFrame()
 
     raw = pd.read_csv(
         io.StringIO("\n".join(lines)),
-        sep="|",
-        header=None,
-        engine="c",
-        dtype=str,
-        na_filter=False,
-        on_bad_lines="skip",
+        sep="|", header=None, engine="c", dtype=str, na_filter=False, on_bad_lines="skip",
     )
     if raw.empty or raw.shape[1] < 10:
         return pd.DataFrame()
 
     raw = raw.iloc[:, :10].copy()
-    raw.columns = [
-        "date", "symbol", "sector_code", "company",
-        "open", "high", "low", "close", "volume", "ldcp",
-    ]
+    raw.columns = ["date", "symbol", "sector_code", "company", "open", "high", "low", "close", "volume", "ldcp"]
     for c in raw.columns:
         raw[c] = (
             raw[c].astype(str)
@@ -212,8 +207,8 @@ def _parse_lis_text(text: str) -> pd.DataFrame:
     return raw.dropna(subset=["date", "symbol", "close"]).reset_index(drop=True)
 
 
-def _parse_any_file(path: str) -> pd.DataFrame:
-    p = path.lower()
+def _parse_any_file(path: Path) -> pd.DataFrame:
+    p = path.as_posix().lower()
     try:
         if p.endswith((".lis", ".z", ".gz", ".txt")):
             return _parse_lis_text(_read_text_safely(path))
@@ -242,7 +237,7 @@ def load_directory(dirpath: str) -> pd.DataFrame:
     for r, _, fs in os.walk(dirpath):
         for f in fs:
             if f.lower().endswith((".lis", ".csv", ".z", ".gz", ".txt")):
-                files.append(os.path.join(r, f))
+                files.append(Path(r) / f)
     if not files:
         return pd.DataFrame()
 
@@ -387,22 +382,31 @@ if data_dir and os.path.isdir(data_dir) and refresh_master:
         st.error("No rows parsed from this directory. Are there .lis/.csv/.Z/.gz files?")
     else:
         df_tmp = _sanitize_symbols(df_tmp)
-        if os.path.exists(MASTER_CSV):
-            old = pd.read_csv(MASTER_CSV, parse_dates=["date"])
-            old["date"] = old["date"].dt.date
+        # start from whichever master exists (runtime preferred)
+        if MASTER_CSV_RUNTIME.exists():
+            old = pd.read_csv(MASTER_CSV_RUNTIME, parse_dates=["date"])
+        elif MASTER_CSV_REPO.exists():
+            old = pd.read_csv(MASTER_CSV_REPO, parse_dates=["date"])
+        else:
+            old = pd.DataFrame(columns=["symbol", "date"])
+
+        if not old.empty:
+            old["date"] = pd.to_datetime(old["date"]).dt.date
             old = _sanitize_symbols(old)
             df_tmp = (
                 pd.concat([old, df_tmp], ignore_index=True)
                 .drop_duplicates(subset=["symbol", "date"])
                 .sort_values(["symbol", "date"])
             )
-        df_tmp.to_csv(MASTER_CSV, index=False)
-        st.success(f"Master dataset refreshed. Rows: {len(df_tmp):,}")
+        MASTER_CSV_RUNTIME.parent.mkdir(parents=True, exist_ok=True)
+        df_tmp.to_csv(MASTER_CSV_RUNTIME, index=False)
+        st.success(f"Master dataset refreshed (saved to {MASTER_CSV_RUNTIME}). Rows: {len(df_tmp):,}")
         st.cache_data.clear()
 
 # Load dataset
-if use_master and os.path.exists(MASTER_CSV):
-    df_all = pd.read_csv(MASTER_CSV, parse_dates=["date"])
+if use_master and (MASTER_CSV_RUNTIME.exists() or MASTER_CSV_REPO.exists()):
+    p = MASTER_CSV_RUNTIME if MASTER_CSV_RUNTIME.exists() else MASTER_CSV_REPO
+    df_all = pd.read_csv(p, parse_dates=["date"])
     df_all["date"] = df_all["date"].dt.date
     df_all = _sanitize_symbols(df_all)
     df_all = _ensure_sector_name(df_all)
@@ -518,7 +522,7 @@ if query:
     m = filtered["symbol"].str.contains(query, na=False) | filtered["company"].str.upper().str.contains(query, na=False)
     filtered = filtered[m]
 
-# EMA flags
+# EMA flags (text used for styling/tooltip)
 def pos_flag(close: pd.Series, ema: pd.Series, tol: float = 0.001) -> pd.Series:
     diff = (close - ema).abs() / ema.replace(0, np.nan)
     out = pd.Series("Above", index=close.index, dtype="object")
@@ -563,7 +567,7 @@ function(params){
 
 st.markdown("#### Trend summary")
 gb1 = GridOptionsBuilder.from_dataframe(summary_df)
-gb1.configure_default_column(filter=False, sortable=True, resizable=True)
+gb1.configure_default_column(filter=False, sortable=True, resizable=True, suppressMenu=True)
 gb1.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=25)
 gb1.configure_column("symbol", width=110)
 gb1.configure_column("sector", width=240)
@@ -599,7 +603,7 @@ def dot_style_js(status_field: str) -> JsCode:
 
 st.markdown("#### EMA analysis")
 gb2 = GridOptionsBuilder.from_dataframe(ema_df)
-gb2.configure_default_column(filter=False, sortable=True, resizable=True)
+gb2.configure_default_column(filter=False, sortable=True, resizable=True, suppressMenu=True)
 gb2.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=25)
 gb2.configure_column("symbol", width=110)
 gb2.configure_column("sector", width=260)
