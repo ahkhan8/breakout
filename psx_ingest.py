@@ -1,115 +1,65 @@
-
-import os
-import io
-import gzip
-import argparse
+import os, io, gzip, zipfile, re, pathlib
 import pandas as pd
 
-SECTOR_MAP_PATH = os.path.join(os.path.dirname(__file__), "sector_map_psx.csv")
-MASTER_CSV = os.path.join(os.path.dirname(__file__), "psx_master.csv")
-COLS = ["date","symbol","sector_code","company","open","high","low","close","volume","ldcp"]
+MONTH_SUFFIX_RE = re.compile(r"-(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$", re.IGNORECASE)
 
-def read_text_safely(path: str) -> str:
-    with open(path, "rb") as fh:
-        head = fh.read(2)
-        fh.seek(0)
-        data = fh.read()
-    if len(head) >= 2 and head[0] == 0x1F and head[1] == 0x8B:
-        with gzip.open(path, "rt", errors="ignore") as gz:
-            return gz.read().replace("\\x00", "").replace("\\u00A0", " ")
-    for enc in ("utf-8-sig", "utf-16", "utf-16le", "utf-16be", "latin-1"):
-        try:
-            return data.decode(enc).replace("\\x00", "").replace("\\u00A0", " ")
-        except Exception:
-            continue
-    return data.decode("utf-8", errors="ignore").replace("\\x00", "").replace("\\u00A0", " ")
+def _sanitize_symbols(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "symbol" in out.columns:
+        out["symbol"] = out["symbol"].astype(str).str.strip().str.upper()
+        out = out[~out["symbol"].str.contains(MONTH_SUFFIX_RE, na=False)]
+    return out
 
-def parse_lis(path: str) -> pd.DataFrame:
-    text = read_text_safely(path)
-    raw = pd.read_csv(io.StringIO(text),
-                      sep="|",
-                      header=None,
-                      engine="python",
-                      dtype=str,
-                      na_filter=False,
-                      on_bad_lines="skip")
-    if raw.shape[1] < 10:
-        for _ in range(10 - raw.shape[1]):
-            raw[raw.shape[1]] = ""
-    raw = raw.iloc[:, :10].copy()
-    raw.columns = COLS
+def _read_text_safely(path: str) -> str:
+    data = pathlib.Path(path).read_bytes()
+    if data[:2] == b"\x1f\x8b":  # gzip
+        return gzip.decompress(data).decode("latin-1", errors="ignore")
+    if data[:2] == b"PK":        # zip
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for name in zf.namelist():
+                return zf.read(name).decode("latin-1", errors="ignore")
+    return data.decode("latin-1", errors="ignore")
 
-    for c in raw.columns:
-        raw[c] = raw[c].astype(str).str.strip()
+def _parse_lis_text(text: str) -> pd.DataFrame:
+    lines = [ln for ln in text.splitlines() if ln.count("|") >= 9]
+    if not lines:
+        return pd.DataFrame()
+    raw = pd.read_csv(io.StringIO("\n".join(lines)), sep="|", header=None, engine="c", na_filter=False)
+    raw = raw.iloc[:, :10]
+    raw.columns = ["date","symbol","sector_code","company","open","high","low","close","volume","ldcp"]
+    raw["date"] = pd.to_datetime(raw["date"], format="%d%b%Y", errors="coerce").dt.date
+    for c in ["open","high","low","close","ldcp","volume"]:
+        raw[c] = pd.to_numeric(raw[c].astype(str).str.replace(",", ""), errors="coerce")
+    return raw.dropna(subset=["date","symbol","close"])
 
-    raw["date"] = pd.to_datetime(raw["date"], format="%d%b%Y", errors="coerce")
+def _parse_any_file(path: str) -> pd.DataFrame:
+    p = path.lower()
+    if p.endswith((".lis",".z",".gz",".txt")):
+        return _parse_lis_text(_read_text_safely(path))
+    elif p.endswith(".csv"):
+        df = pd.read_csv(path)
+        if "symbol" not in df.columns or "close" not in df.columns:
+            return pd.DataFrame()
+        df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+        return df.dropna(subset=["date","symbol","close"])
+    return pd.DataFrame()
 
-    for c in ["open","high","low","close","volume","ldcp"]:
-        raw[c] = pd.to_numeric(raw[c].str.replace(",","").str.replace("\\u00A0",""), errors="coerce")
-
-    raw["symbol"] = raw["symbol"].str.upper()
-    raw["sector_code"] = raw["sector_code"].str.zfill(4)
-
-    try:
-        sector = pd.read_csv(SECTOR_MAP_PATH, dtype=str)
-        sector["sector_code"] = sector["sector_code"].str.zfill(4)
-        raw = raw.merge(sector, on="sector_code", how="left")
-    except Exception:
-        raw["sector_name"] = None
-
-    raw = raw.dropna(subset=["date","symbol","close"]).copy()
-    raw["date"] = pd.to_datetime(raw["date"]).dt.date
-    return raw
-
-def update_master(src_dir: str):
-    src_dir = os.path.abspath(src_dir)
-    all_files = [os.path.join(src_dir, f) for f in os.listdir(src_dir)
-                 if f.lower().endswith((".lis",".z",".gz",".csv",".txt"))]
+def load_directory(dirpath: str) -> pd.DataFrame:
+    files = []
+    for root,_,fs in os.walk(dirpath):
+        for f in fs:
+            if f.lower().endswith((".lis",".csv",".z",".gz",".txt")):
+                files.append(os.path.join(root,f))
     frames = []
-    for fp in sorted(all_files):
-        try:
-            if fp.lower().endswith((".lis",".z",".gz")):
-                df = parse_lis(fp)
-            else:
-                df_raw = pd.read_csv(fp, engine="python")
-                df_raw.columns = df_raw.columns.str.lower()
-                if "symbol" in df_raw.columns and "close" in df_raw.columns:
-                    df = pd.DataFrame({
-                        "date": pd.to_datetime(df_raw.get("date"), errors="coerce").dt.date,
-                        "symbol": df_raw["symbol"].astype(str).str.upper(),
-                        "open": pd.to_numeric(df_raw.get("open"), errors="coerce"),
-                        "high": pd.to_numeric(df_raw.get("high"), errors="coerce"),
-                        "low":  pd.to_numeric(df_raw.get("low"), errors="coerce"),
-                        "close":pd.to_numeric(df_raw.get("close"), errors="coerce"),
-                        "volume":pd.to_numeric(df_raw.get("volume"), errors="coerce"),
-                    })
-                else:
-                    df = pd.DataFrame()
-            if not df.empty:
-                frames.append(df)
-        except Exception as e:
-            print(f"Skipping {fp}: {e}")
-
+    for fp in sorted(files):
+        df = _parse_any_file(fp)
+        if not df.empty:
+            frames.append(df)
     if not frames:
-        print("No rows parsed."); return
-
-    new_data = pd.concat(frames, ignore_index=True)
-    if os.path.exists(MASTER_CSV):
-        master = pd.read_csv(MASTER_CSV, parse_dates=["date"])
-        master["date"] = master["date"].dt.date
-        combined = pd.concat([master, new_data], ignore_index=True)
-    else:
-        combined = new_data
-
-    combined = (combined
-                .sort_values(["symbol","date"])
-                .drop_duplicates(subset=["symbol","date"], keep="last")
-                .reset_index(drop=True))
-    combined.to_csv(MASTER_CSV, index=False)
-    print("Updated master:", MASTER_CSV, "rows:", len(combined))
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Parse PSX .lis/.Z/.gz and update master CSV")
-    ap.add_argument("src_dir", help="Directory containing files")
-    args = ap.parse_args()
-    update_master(args.src_dir)
+        return pd.DataFrame()
+    df_all = pd.concat(frames, ignore_index=True)
+    df_all = df_all.drop_duplicates(subset=["symbol","date"]).sort_values(["symbol","date"])
+    return _sanitize_symbols(df_all)
