@@ -4,6 +4,8 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
+git pull --rebase --autostash || true
+
 DATA_DIR="data"
 MASTER_CSV="psx_master.csv"
 
