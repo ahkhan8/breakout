@@ -348,7 +348,7 @@ def compute_all_indicators(df: pd.DataFrame, n_daily=20, n_weekly=10, n_monthly=
 
         gm = (
             g.set_index("date")
-            .resample("M")
+            .resample("ME")
             .agg({"high": "max", "low": "min", "close": "last"})
             .dropna(subset=["close"])
         )
