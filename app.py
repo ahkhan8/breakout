@@ -266,25 +266,6 @@ def load_directory(dirpath: str) -> pd.DataFrame:
 
     return df_all
 
-# --- Backfill sector_name for rows that are missing it (use last known per symbol) ---
-if "sector_name" not in df_all.columns:
-    df_all["sector_name"] = ""
-
-# build a lookup: for each symbol, the most recent non-empty sector_name we have
-tmp = (
-    df_all.loc[df_all["sector_name"].astype(str).str.len() > 0, ["symbol", "date", "sector_name"]]
-    .sort_values(["symbol", "date"])
-)
-last_known = (
-    tmp.groupby("symbol", as_index=True)["sector_name"]
-       .last()  # last in date order per symbol
-)
-
-# fill missing sector_name from this lookup
-needs_fill = df_all["sector_name"].astype(str).str.len() == 0
-df_all.loc[needs_fill, "sector_name"] = df_all.loc[needs_fill, "symbol"].map(last_known).fillna("")
-
-
 # =========================
 # Indicators
 # =========================
@@ -436,6 +417,25 @@ else:
 if df_all.empty:
     st.info("Provide a folder with .lis/.csv/.Z/.gz files, or use the master dataset.")
     st.stop()
+
+
+# --- Backfill sector_name for rows that are missing it (use last known per symbol) ---
+if "sector_name" not in df_all.columns:
+    df_all["sector_name"] = ""
+
+# build a lookup: for each symbol, the most recent non-empty sector_name we have
+tmp = (
+    df_all.loc[df_all["sector_name"].astype(str).str.len() > 0, ["symbol", "date", "sector_name"]]
+    .sort_values(["symbol", "date"])
+)
+last_known = (
+    tmp.groupby("symbol", as_index=True)["sector_name"]
+       .last()  # last in date order per symbol
+)
+
+# fill missing sector_name from this lookup
+needs_fill = df_all["sector_name"].astype(str).str.len() == 0
+df_all.loc[needs_fill, "sector_name"] = df_all.loc[needs_fill, "symbol"].map(last_known).fillna("")
 
 # =========================
 # Parameters
