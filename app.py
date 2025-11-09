@@ -148,6 +148,30 @@ def _ensure_sector_name(df: pd.DataFrame) -> pd.DataFrame:
         out["sector_name"] = out.get("sector_name", "")
     return out
 
+def _backfill_sector_name(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fill empty sector_name by using the last known non-empty sector_name per symbol
+    (based on available history in the master file).
+    """
+    if df.empty:
+        return df
+    out = df.copy()
+    if "sector_name" not in out.columns:
+        out["sector_name"] = ""
+
+    # build lookup from non-empty sector_name in history
+    tmp = (
+        out.loc[out["sector_name"].astype(str).str.strip() != "", ["symbol", "date", "sector_name"]]
+          .copy()
+    )
+    if not tmp.empty:
+        tmp["date"] = pd.to_datetime(tmp["date"])
+        tmp = tmp.sort_values(["symbol", "date"])
+        last_known = tmp.groupby("symbol", as_index=True)["sector_name"].last()
+        needs = out["sector_name"].astype(str).str.strip() == ""
+        out.loc[needs, "sector_name"] = out.loc[needs, "symbol"].map(last_known).fillna(out.loc[needs, "sector_name"])
+    return out
+
 
 def _read_text_safely(path: Path) -> str:
     data = path.read_bytes()
@@ -436,6 +460,20 @@ last_known = (
 # fill missing sector_name from this lookup
 needs_fill = df_all["sector_name"].astype(str).str.len() == 0
 df_all.loc[needs_fill, "sector_name"] = df_all.loc[needs_fill, "symbol"].map(last_known).fillna("")
+
+# Auto-backfill sectors and persist to master if anything changes
+if not df_all.empty:
+    before = df_all["sector_name"].astype(str).fillna("")
+    df_all = _backfill_sector_name(df_all)
+    after = df_all["sector_name"].astype(str).fillna("")
+    if not before.equals(after):
+        # choose a writable target
+        target = MASTER_CSV_RUNTIME if (MASTER_CSV_RUNTIME.parent.exists() and os.access(MASTER_CSV_RUNTIME.parent, os.W_OK)) else MASTER_CSV_REPO
+        # when saving, keep 'date' as ISO date
+        df_to_save = df_all.copy()
+        df_to_save["date"] = pd.to_datetime(df_to_save["date"]).dt.date
+        df_to_save.to_csv(target, index=False)
+        st.info(f"Sector names backfilled and saved to {target}")
 
 # =========================
 # Parameters
